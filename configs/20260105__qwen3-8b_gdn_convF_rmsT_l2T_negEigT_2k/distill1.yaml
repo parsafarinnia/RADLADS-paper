@@ -2,18 +2,16 @@ model:
   ctx_len: 2048
 
 train:
-  wandb: qwen2rwkv
+  wandb: hybrid_training
   
   proj_suffix: 1
   train_stage: 3
   load_partial: 1
 
   data_type: "binidx" 
-  data_file: "/mnt/nfs/parsa/data/radlad_data_steps/stag0_100M"
-  # NOTE: Calculate magic_prime using: python3 make_data_hf.py check /mnt/nfs/parsa/data/radlad_data_steps/stag0_100M 2048
-  # Update my_exit_tokens based on your actual dataset size
-  my_exit_tokens: 100000000  # Update this based on your dataset size
-  magic_prime: 48827  # PLACEHOLDER - Calculate using make_data_hf.py check command above
+  data_file: "/mnt/nfs/parsa/data/radlad_data_steps/stag0_100M_binidx"
+  my_exit_tokens: 99979300
+  magic_prime: 48809
 
   optimizer: dsfusedadamw
   lr_decay_type: cos

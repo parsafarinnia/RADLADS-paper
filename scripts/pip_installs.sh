@@ -10,8 +10,8 @@ pip install lm-eval[longbench]
 pip install lm-eval[ruler]
 
 pip install python-Levenshtein
-pip install -U git+https://github.com/fla-org/flash-linear-attention --no-deps # --no-use-pep517
+pip install git+https://github.com/fla-org/flash-linear-attention@3ddba2a043100837a1f6499b5eb6692de71a477b --no-deps # pinned commit from pip_dep.txt
 
 # for radlads
 # pip install lightning torch flash-linear-attention triton deepspeed wandb ninja --upgrade
-pip install lightning triton deepspeed wandb ninja
+pip install lightning==2.5.6 triton==3.2.0 deepspeed wandb ninja
