@@ -127,7 +127,7 @@ class Train_Config:
 
     load_model:str = 'auto'
     wandb:str = ''
-    proj_dir:str = '/work/hei/radlads/out/pths'
+    proj_dir:str = '/work/aman/radlads/out/pths'
     proj_name:str = ''
     proj_suffix0:str = ''
     proj_suffix:str = '0'

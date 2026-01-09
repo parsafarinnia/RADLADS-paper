@@ -111,7 +111,7 @@ for i in "${checkpoints[@]}"; do
             --tokenizer_name ${tokenizer} \
             --tasks ${tasks} \
             --limit 16 \
-            --log_path logs/20251231/bsz1
+            --log_path logs/20251231/bsz1.log
             # gsm8k
     else
         echo "Checkpoint does not exist: $CKPT_PATH, skipping."

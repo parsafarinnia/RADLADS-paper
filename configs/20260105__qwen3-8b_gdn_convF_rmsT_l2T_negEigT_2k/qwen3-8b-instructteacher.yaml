@@ -1,6 +1,6 @@
 train:
   teacher:
-    path: /work/parsa/pths/Qwen3-8B-Base/pretrained.pth
+    path: /work/aman/pths/Qwen3-8B-Base/pretrained.pth
     model:
       __type__: configs.Transformer_Config
       classname: qwen3

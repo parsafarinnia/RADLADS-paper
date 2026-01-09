@@ -28,8 +28,11 @@ from src.pipeline import PIPELINE, PIPELINE_ARGS
 from lm_eval import tasks, evaluator, utils
 from lm_eval.models.huggingface import HFLM
 
-from qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from qwen2.configuration_qwen2 import Qwen2Config
+# from qwen2.modeling_qwen2 import Qwen2ForCausalLM
+# from qwen2.configuration_qwen2 import Qwen2Config
+
+from qwen3gdn.modeling_qwen3_latest import Qwen3ForCausalLM
+from qwen3gdn.configuration_qwen3 import Qwen3Config
 
 from tqdm import tqdm
 
@@ -86,7 +89,7 @@ if True:
             exit(0)
         #config_class = model_factory.config_class
         print(config.model.hf_cfg)
-        model = Qwen2ForCausalLM(Qwen2Config(rwkv='rwkv' in config.model.tmix, **config.model.hf_cfg), config)
+        model = Qwen3ForCausalLM(Qwen3Config(config))
         #model = model_factory(config_class(**hf_config))
     elif classname != '':
         if '.' in classname:

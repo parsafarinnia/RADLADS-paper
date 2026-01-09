@@ -1,15 +1,15 @@
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-export USERNAME=$(whoami)
+export USERNAME=aman
 pths_dir=/work/${USERNAME}/pths
-out_pths_dir=/work/${USERNAME}/RADLADS-paper/out/pths
-out_hf_dir=/work/${USERNAME}/RADLADS-paper/out/hf
+out_pths_dir=/work/${USERNAME}/radlads/out/pths
+out_hf_dir=/work/${USERNAME}/radlads/out/hf
 
 RUN_NAME="20260105__qwen3-8b_gdn_convF_rmsT_l2T_negEigT_2k"
 
 STEP0_DIR="${RUN_NAME}-1"
 STEP1_DIR="${RUN_NAME}-2"
-STEP2_DIR="${RUN_NAME}-3"
+STEP2_DIR="${RUN_NAME}-4-2k"
 
 STEP0_PTH_PATH="${out_pths_dir}/${STEP0_DIR}"
 STEP1_PTH_PATH="${out_pths_dir}/${STEP1_DIR}"
@@ -21,6 +21,6 @@ all_orig_attn="configs/${RUN_NAME}/qwen3-8b_all_orig_attn.yaml"
 tokenizer="Qwen/Qwen3-8B-Base"
 
 # WandB configuration
-export WANDB_PROJECT="hybrid_training"
-export WANDB_API_KEY="95101606537949dcfd5f3dc964b4cceb06343423"
+export WANDB_PROJECT="RADLADS"
+export WANDB_API_KEY="4fbb0c378db64cd852ba57fd57e1458e32bf7318"
 

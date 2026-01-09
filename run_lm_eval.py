@@ -166,6 +166,7 @@ match config.precision:
 
 device = 'cuda'
 model = model.to(device=device, dtype=dtype)
+model.device = next(model.parameters()).device
 model.eval()
 
 #pipeline = PIPELINE(model, "rwkv_vocab_v20230424")
@@ -191,6 +192,8 @@ class TokenizerWrapper:
         self.tokenizer = tokenizer
         #self.eos_token_id = 0
         self.eos_token_id = tokenizer.eos_token_id
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.pad_token = tokenizer.eos_token
 
     def encode(self, string: str, add_special_tokens=False):
         return self.tokenizer.encode(string)
@@ -198,339 +201,387 @@ class TokenizerWrapper:
     def decode(self, tokens):
         return self.tokenizer.decode(tokens)
 
+# from lm_eval.api.model import TemplateLM
+
+from lm_eval.models.huggingface import HFLM
+from lm_eval.api.model import TemplateLM
+
 class EvalHarnessAdapter(TemplateLM):
-    # bugfix for lm_eval 0.4.2
-    AUTO_MODEL_CLASS = AutoModelForCausalLM
-
-    def __init__(self, batch_size_per_gpu, tokenizer):
+    def __init__(self, model, tokenizer, batch_size_per_gpu):
         super().__init__()
-        self.tokenizer = tokenizer
-        self.batch_size_per_gpu = batch_size_per_gpu
-        self.request_counter = 0
 
-    def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
-        raise NotImplementedError(
-            "`loglikelihood_rolling` is currently not supported"
+        self.hf_lm = HFLM(
+            pretrained=model,
+            tokenizer=tokenizer,
+            batch_size=batch_size_per_gpu,
+            device="cuda",
+            dtype="bfloat16",
+            max_length=32768,
+            trust_remote_code=True,
         )
-    
-    @torch.no_grad()
-    def greedy_generate(self, ctx, state=None, key_values=None):
 
-        logits_list = []
-        if config.is_pretrained == "yes":
-            inputs = self.tokenizer([ctx], return_tensors="pt").to(model.device)
-            inputs_len = inputs['input_ids'].shape[1]
-            outputs = model.generate(**inputs, max_new_tokens=self.max_gen_toks)
-            out_str = tokenizer.decode(outputs[0][inputs_len:], skip_special_tokens=True)
-        else:
-
-            last_model_state = state
-            past_key_values = key_values
-
-            STOP_TOKEN = [self.tokenizer.eos_token_id]
-
-            all_tokens = []
-            out_last = 0
-            out_str = ''
-
-            
-            max_gen_toks = self.max_gen_toks
-            # max_gen_toks = 1
-            for i in range(max_gen_toks):
-                tokens = self.tokenizer.encode(ctx) if i == 0 else [token]
-                chunk_size = self.max_length
-                chunk_size = len(tokens)
-                # breakpoint()
-                # hei: below loop is for chunk_parallel?
-                while len(tokens) > 0:
-                    # print (f"greedy_generate {len(tokens)=} {tokens[:self.max_length]=}")
-                    results = model.forward(tokens[:chunk_size], last_model_state=state, past_key_values=past_key_values)
-                    if isinstance(results, tuple):
-                        logits = results[0]
-                        last_model_state = results[1]
-                        past_key_values = results[-1]
-                    elif isinstance(results, torch.Tensor):
-                        logits = results
-                        #next_model_state = last_model_state
-                    else:
-                        logits = results.logits
-                        last_model_state = results.model_state
-                        past_key_values = results.key_values
-                    tokens = tokens[chunk_size:]
-                logits_list.append(logits[0,-1])
-                token = logits[0,-1:].argmax().item()
-                if token in STOP_TOKEN:
-                    break
-                all_tokens += [token]
-                tmp = self.tokenizer.decode(all_tokens[out_last:])
-                if '\ufffd' not in tmp: # is valid utf-8 string?
-                    out_str += tmp
-                    out_last = i + 1
-        # print (f"{ctx=}")
-        # print (out_str)
-        return out_str, logits_list
-
-    @torch.no_grad()
-    def batch_greedy_generate(self, input_texts, state=None, key_values=None):
-
-
-        logits_list = []
-        inputs = self.tokenizer(input_texts, padding=True, return_tensors='pt').to(device)
-        if config.is_pretrained == "yes":
-            # breakpoint()
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=self.max_gen_toks,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
-            # breakpoint()
-            out_str_batch = [
-                tokenizer.decode(outputs[i][len(inputs['input_ids'][i]):], skip_special_tokens=True)
-                for i in range(len(input_texts))
-            ]
-        else:
-
-            last_model_state = state
-            past_key_values = key_values
-
-            STOP_TOKEN = [self.tokenizer.eos_token_id]
-            batch_input_ids = inputs['input_ids']
-
-            is_eos_generated = [False for _ in range(len(batch_input_ids))]
-
-            all_tokens_batch = [[] for _ in range(len(batch_input_ids))]
-            out_str_batch = ['' for _ in range(len(batch_input_ids))]
-            out_last = 0
-
-            input_ids_padded_batch_list = []
-            attention_mask_batch_list = []
-            # stack and pad to longest
-            maxlen = max([len(x) for x in batch_input_ids])
-            # maxlen = (maxlen + 7) // 8 * 8 # round pad size up to nearest 8 for better GPU usage
-            for i in range(len(batch_input_ids)):
-                padded_len = (maxlen - len(batch_input_ids[i]))
-                # breakpoint()
-                input_ids_padded_batch_list.append(
-                    F.pad(
-                        batch_input_ids[i],
-                        (padded_len, 0),
-                        value=model.config.model.vocab_padding_idx # self.tokenizer.special_tokens_map["pad_token"]
-                    )
-                )
-                attention_mask_batch_list.append([0] * padded_len + [1] * len(batch_input_ids[i]))
-            input_ids_padded_batch = torch.stack(input_ids_padded_batch_list, dim=0)
-            input_ids_padded_batch = input_ids_padded_batch.to(device)
-            attention_mask_batch = torch.tensor(attention_mask_batch_list, dtype=torch.long)
-            attention_mask_batch = attention_mask_batch.to(device)
-            last_token_batch = None
-            
-            max_gen_toks = self.max_gen_toks
-            # max_gen_toks = 1
-            for i in range(max_gen_toks):
-                tokens = input_ids_padded_batch if i == 0 else last_token_batch
-                # breakpoint()
-                # print (f"batch_greedy_generate {tokens=}")
-                results = model.forward(tokens.to(device), last_model_state=last_model_state, past_key_values=past_key_values, attention_mask=attention_mask_batch)
-                if isinstance(results, tuple):
-                    logits = results[0]
-                    last_model_state = results[1]
-                    past_key_values = results[-1]
-                elif isinstance(results, torch.Tensor):
-                    logits = results
-                    #next_model_state = last_model_state
-                else:
-                    logits = results.logits
-                    last_model_state = results.model_state
-                    past_key_values = results.key_values
-                logits_list.append(logits[:,-1,:])  # Save logits for all instances in batch [batch_size, vocab_size]
-                last_token_batch = logits[:,-1:,:].argmax(dim=-1) #, keepdims=True)
-                is_eos_generated = [
-                    is_eos_generated[i] or last_token_batch[i][-1].detach().cpu() in STOP_TOKEN
-                    for i in range(len(last_token_batch))
-                ]
-                if all(is_eos_generated):
-                    break
-                for i in range(len(out_str_batch)):
-                    # all_tokens_batch[i].append(last_token_batch[i])
-                    if not is_eos_generated[i]:
-                        tmp = self.tokenizer.decode(last_token_batch[i][-1])
-                        if '\ufffd' not in tmp: # is valid utf-8 string?
-                            out_str_batch[i] += tmp
-
-        # print (f"{out_str_batch=}")
-        # breakpoint()
-        return out_str_batch, logits_list
-    
-    @torch.no_grad()
-    def generate_until(self, requests):
-        """
-        Generate until is lm_eval harness' way to say "do greedy generation" - necessary for some tasks.
-        the eval harness dispatches requests to the model, and the model does argmax generation, the results of which
-        are returned to the eval harness to evaluate.
-
-        TODO: batched / data parallel generation
-
-        :param requests: Dictionary of requests containing the context (prompt) and 'until' - a token or
-                         list of stop tokens.
-        """
-
-
-        res = []
-        ###batch
-        self.tokenizer.padding_side = 'left'
-        # get only the args from each Instance object
-        reqs = [req.args for req in requests]
-        def _collate(x):
-            encoded = self.tokenizer.encode(x[0])
-            return (-len(encoded), x[0])
-        
-        reord = utils.Reorderer(reqs, _collate)
-        sorted_reqs = reord.get_reordered()
-        sorted_input_texts, sorted_gen_kwargs = zip(*sorted_reqs)
-        # sort requests by descending total length, so we batch together groups that have similar padded sizes, descending so we OOM early if at all
-        B = self.batch_size_per_gpu
-
-        if B >= 1:
-
-            for nb in tqdm(range(0, len(sorted_reqs), B), "Running batched greedy generation"):
-                ne = min(nb+B, len(sorted_reqs))
-                out_str_batch, logits_list_batch = self.batch_greedy_generate(sorted_input_texts[nb:ne])
-                
-                for i in range(nb, ne):
-                    res.append(out_str_batch[i - nb])
-                    for term in sorted_gen_kwargs[i]['until']:
-                        res[i] = res[i].split(term)[0]
-        ###
-        
-        # print ("\n"*6)
-        # print ("================="*30)
-        # print ("\n"*6)
-
-        ### below is original inference impl
-        # elif B == 1:
-        #     for context, gen_kwargs in tqdm(reord.get_reordered(), "Running greedy generation"):
-        #         out_str, logits_list = self.greedy_generate(context)
-                
-        #         for term in gen_kwargs['until']:
-        #             out_str = out_str.split(term)[0]
-        #         res.append(out_str)
-
-        return reord.get_original(res)
-
+    # ---- REQUIRED PROPERTIES ----
 
     @property
     def eot_token_id(self):
-        # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
-        return self.tokenizer.eos_token_id
+        return self.hf_lm.eot_token_id
 
-    @property
-    def max_length(self):
-        # FIXME - is this correct? is it even used? didn't seem to be
-        # FIXME - we really should support recurrent inference
-        return config.model.ctx_len
-        # try:
-        #     return self.gpt2.config.n_ctx
-        # except AttributeError:
-        #     # gptneoconfig doesn't have n_ctx apparently
-        #     return self.gpt2.config.max_position_embeddings
+    def tok_encode(self, string):
+        return self.hf_lm.tok_encode(string)
 
-    @property
-    def max_gen_toks(self):
-        # FIXME - is this correct? is it even used? didn't seem to be, since the model itself complained at 512 when returning 256 here
-        # FIXME - we really should support recurrent inference
-        return config.model.ctx_len
+    # ---- CORE: delegate to HF ----
 
-    @property
-    def batch_size(self):
-        # TODO: fix multi-gpu
-        return self.batch_size_per_gpu  # * gpus
-
-    @property
-    def device(self):
-        # Isn't used because we override _loglikelihood_tokens
-        raise NotImplementedError()
-
-    def tok_encode(self, string: str):
-        return self.tokenizer.encode(string, add_special_tokens=False)
-
-    def tok_decode(self, tokens):
-        return self.tokenizer.decode(tokens)
-
-    @torch.no_grad()
     def _loglikelihood_tokens(self, requests, disable_tqdm=False):
-        global logitBuf, correctBuf
+        return self.hf_lm._loglikelihood_tokens(
+            requests, disable_tqdm=disable_tqdm
+        )
 
-        res = []
+    def loglikelihood_rolling(self, requests, disable_tqdm=False):
+        return self.hf_lm.loglikelihood_rolling(
+            requests, disable_tqdm=disable_tqdm
+        )
 
-        # sort requests by descending total length, so we batch together groups that have similar padded sizes, descending so we OOM early if at all
-        rq_indices = sorted(range(len(requests)),key=lambda i: len(requests[i][1])+len(requests[i][2]), reverse=True)
+    def generate_until(self, requests, disable_tqdm=False):
+        return self.hf_lm.generate_until(
+            requests, disable_tqdm=disable_tqdm
+        )
 
-        res = [None for _ in range(len(requests))]
 
-        B = self.batch_size_per_gpu
-        for nb in range(0, len(requests), B):
-            ne = min(nb+B, len(requests))
 
-            # stack and pad to longest
-            batched_inputs = []
-            batch_info = []
-            maxlen = 0
-            for i in range(nb, ne):
-                rq_index = rq_indices[i]
-                request = requests[rq_index]
-                q = RWKV_PAD + request[1]
-                src = q + request[2]
-                input = torch.tensor(src, dtype=torch.long, device=device, requires_grad=False)
-                batched_inputs.append( input )
-                batch_info.append((len(q), len(src), rq_index))
-                maxlen = max(maxlen, len(src))
 
-            maxlen = (maxlen + 7) // 8 * 8 # round pad size up to nearest 8 for better GPU usage
-            for i in range(len(batched_inputs)):
-                batched_inputs[i] = F.pad(batched_inputs[i], (0, maxlen - batched_inputs[i].size(0)))
-            batched_inputs = torch.stack(batched_inputs, dim=0)
+# class EvalHarnessAdapter(TemplateLM):
+#     # bugfix for lm_eval 0.4.2
+#     AUTO_MODEL_CLASS = AutoModelForCausalLM
 
-            results = model.forward(batched_inputs, None)
-            if isinstance(results, tuple):
-                logits = results[0]
-                #next_model_state = results[1]
-            elif isinstance(results, torch.Tensor):
-                logits = results
-                #next_model_state = last_model_state
-            else:
-                logits = results.logits
-                #next_model_state = last_model_state
+#     def __init__(self, batch_size_per_gpu, tokenizer):
+#         super().__init__()
+#         self.tokenizer = tokenizer
+#         self.batch_size_per_gpu = batch_size_per_gpu
+#         self.request_counter = 0
+
+#     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
+#         raise NotImplementedError(
+#             "`loglikelihood_rolling` is currently not supported"
+#         )
+    
+#     @torch.no_grad()
+#     def greedy_generate(self, ctx, state=None, key_values=None):
+
+#         logits_list = []
+#         if config.is_pretrained == "yes":
+#             inputs = self.tokenizer([ctx], return_tensors="pt").to(model.device)
+#             inputs_len = inputs['input_ids'].shape[1]
+#             outputs = model.generate(**inputs, max_new_tokens=self.max_gen_toks)
+#             out_str = tokenizer.decode(outputs[0][inputs_len:], skip_special_tokens=True)
+#         else:
+
+#             last_model_state = state
+#             past_key_values = key_values
+
+#             STOP_TOKEN = [self.tokenizer.eos_token_id]
+
+#             all_tokens = []
+#             out_last = 0
+#             out_str = ''
+
+            
+#             max_gen_toks = self.max_gen_toks
+#             # max_gen_toks = 1
+#             for i in range(max_gen_toks):
+#                 tokens = self.tokenizer.encode(ctx) if i == 0 else [token]
+#                 chunk_size = self.max_length
+#                 chunk_size = len(tokens)
+#                 # breakpoint()
+#                 # hei: below loop is for chunk_parallel?
+#                 while len(tokens) > 0:
+#                     # print (f"greedy_generate {len(tokens)=} {tokens[:self.max_length]=}")
+#                     results = model.forward(tokens[:chunk_size], last_model_state=state, past_key_values=past_key_values)
+#                     if isinstance(results, tuple):
+#                         logits = results[0]
+#                         last_model_state = results[1]
+#                         past_key_values = results[-1]
+#                     elif isinstance(results, torch.Tensor):
+#                         logits = results
+#                         #next_model_state = last_model_state
+#                     else:
+#                         logits = results.logits
+#                         last_model_state = results.model_state
+#                         past_key_values = results.key_values
+#                     tokens = tokens[chunk_size:]
+#                 logits_list.append(logits[0,-1])
+#                 token = logits[0,-1:].argmax().item()
+#                 if token in STOP_TOKEN:
+#                     break
+#                 all_tokens += [token]
+#                 tmp = self.tokenizer.decode(all_tokens[out_last:])
+#                 if '\ufffd' not in tmp: # is valid utf-8 string?
+#                     out_str += tmp
+#                     out_last = i + 1
+#         # print (f"{ctx=}")
+#         # print (out_str)
+#         return out_str, logits_list
+
+#     @torch.no_grad()
+#     def batch_greedy_generate(self, input_texts, state=None, key_values=None):
+
+
+#         logits_list = []
+#         inputs = self.tokenizer(input_texts, padding=True, return_tensors='pt').to(device)
+#         if config.is_pretrained == "yes":
+#             # breakpoint()
+#             outputs = model.generate(
+#                 **inputs,
+#                 max_new_tokens=self.max_gen_toks,
+#                 eos_token_id=self.tokenizer.eos_token_id,
+#                 pad_token_id=self.tokenizer.eos_token_id
+#             )
+#             # breakpoint()
+#             out_str_batch = [
+#                 tokenizer.decode(outputs[i][len(inputs['input_ids'][i]):], skip_special_tokens=True)
+#                 for i in range(len(input_texts))
+#             ]
+#         else:
+
+#             last_model_state = state
+#             past_key_values = key_values
+
+#             STOP_TOKEN = [self.tokenizer.eos_token_id]
+#             batch_input_ids = inputs['input_ids']
+
+#             is_eos_generated = [False for _ in range(len(batch_input_ids))]
+
+#             all_tokens_batch = [[] for _ in range(len(batch_input_ids))]
+#             out_str_batch = ['' for _ in range(len(batch_input_ids))]
+#             out_last = 0
+
+#             input_ids_padded_batch_list = []
+#             attention_mask_batch_list = []
+#             # stack and pad to longest
+#             maxlen = max([len(x) for x in batch_input_ids])
+#             # maxlen = (maxlen + 7) // 8 * 8 # round pad size up to nearest 8 for better GPU usage
+#             for i in range(len(batch_input_ids)):
+#                 padded_len = (maxlen - len(batch_input_ids[i]))
+#                 # breakpoint()
+#                 input_ids_padded_batch_list.append(
+#                     F.pad(
+#                         batch_input_ids[i],
+#                         (padded_len, 0),
+#                         value=model.config.model.vocab_padding_idx # self.tokenizer.special_tokens_map["pad_token"]
+#                     )
+#                 )
+#                 attention_mask_batch_list.append([0] * padded_len + [1] * len(batch_input_ids[i]))
+#             input_ids_padded_batch = torch.stack(input_ids_padded_batch_list, dim=0)
+#             input_ids_padded_batch = input_ids_padded_batch.to(device)
+#             attention_mask_batch = torch.tensor(attention_mask_batch_list, dtype=torch.long)
+#             attention_mask_batch = attention_mask_batch.to(device)
+#             last_token_batch = None
+            
+#             max_gen_toks = self.max_gen_toks
+#             # max_gen_toks = 1
+#             for i in range(max_gen_toks):
+#                 tokens = input_ids_padded_batch if i == 0 else last_token_batch
+#                 # breakpoint()
+#                 # print (f"batch_greedy_generate {tokens=}")
+#                 results = model.forward(tokens.to(device), last_model_state=last_model_state, past_key_values=past_key_values, attention_mask=attention_mask_batch)
+#                 if isinstance(results, tuple):
+#                     logits = results[0]
+#                     last_model_state = results[1]
+#                     past_key_values = results[-1]
+#                 elif isinstance(results, torch.Tensor):
+#                     logits = results
+#                     #next_model_state = last_model_state
+#                 else:
+#                     logits = results.logits
+#                     last_model_state = results.model_state
+#                     past_key_values = results.key_values
+#                 logits_list.append(logits[:,-1,:])  # Save logits for all instances in batch [batch_size, vocab_size]
+#                 last_token_batch = logits[:,-1:,:].argmax(dim=-1) #, keepdims=True)
+#                 is_eos_generated = [
+#                     is_eos_generated[i] or last_token_batch[i][-1].detach().cpu() in STOP_TOKEN
+#                     for i in range(len(last_token_batch))
+#                 ]
+#                 if all(is_eos_generated):
+#                     break
+#                 for i in range(len(out_str_batch)):
+#                     # all_tokens_batch[i].append(last_token_batch[i])
+#                     if not is_eos_generated[i]:
+#                         tmp = self.tokenizer.decode(last_token_batch[i][-1])
+#                         if '\ufffd' not in tmp: # is valid utf-8 string?
+#                             out_str_batch[i] += tmp
+
+#         # print (f"{out_str_batch=}")
+#         # breakpoint()
+#         return out_str_batch, logits_list
+    
+#     @torch.no_grad()
+#     def generate_until(self, requests):
+#         """
+#         Generate until is lm_eval harness' way to say "do greedy generation" - necessary for some tasks.
+#         the eval harness dispatches requests to the model, and the model does argmax generation, the results of which
+#         are returned to the eval harness to evaluate.
+
+#         TODO: batched / data parallel generation
+
+#         :param requests: Dictionary of requests containing the context (prompt) and 'until' - a token or
+#                          list of stop tokens.
+#         """
+
+
+#         res = []
+#         ###batch
+#         self.tokenizer.padding_side = 'left'
+#         # get only the args from each Instance object
+#         reqs = [req.args for req in requests]
+#         def _collate(x):
+#             encoded = self.tokenizer.encode(x[0])
+#             return (-len(encoded), x[0])
+        
+#         reord = utils.Reorderer(reqs, _collate)
+#         sorted_reqs = reord.get_reordered()
+#         sorted_input_texts, sorted_gen_kwargs = zip(*sorted_reqs)
+#         # sort requests by descending total length, so we batch together groups that have similar padded sizes, descending so we OOM early if at all
+#         B = self.batch_size_per_gpu
+
+#         if B >= 1:
+
+#             for nb in tqdm(range(0, len(sorted_reqs), B), "Running batched greedy generation"):
+#                 ne = min(nb+B, len(sorted_reqs))
+#                 out_str_batch, logits_list_batch = self.batch_greedy_generate(sorted_input_texts[nb:ne])
+                
+#                 for i in range(nb, ne):
+#                     res.append(out_str_batch[i - nb])
+#                     for term in sorted_gen_kwargs[i]['until']:
+#                         res[i] = res[i].split(term)[0]
+#         ###
+        
+#         # print ("\n"*6)
+#         # print ("================="*30)
+#         # print ("\n"*6)
+
+#         ### below is original inference impl
+#         # elif B == 1:
+#         #     for context, gen_kwargs in tqdm(reord.get_reordered(), "Running greedy generation"):
+#         #         out_str, logits_list = self.greedy_generate(context)
+                
+#         #         for term in gen_kwargs['until']:
+#         #             out_str = out_str.split(term)[0]
+#         #         res.append(out_str)
+
+#         return reord.get_original(res)
+
+
+#     @property
+#     def eot_token_id(self):
+#         # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
+#         return self.tokenizer.eos_token_id
+
+#     @property
+#     def max_length(self):
+#         # FIXME - is this correct? is it even used? didn't seem to be
+#         # FIXME - we really should support recurrent inference
+#         return config.model.ctx_len
+#         # try:
+#         #     return self.gpt2.config.n_ctx
+#         # except AttributeError:
+#         #     # gptneoconfig doesn't have n_ctx apparently
+#         #     return self.gpt2.config.max_position_embeddings
+
+#     @property
+#     def max_gen_toks(self):
+#         # FIXME - is this correct? is it even used? didn't seem to be, since the model itself complained at 512 when returning 256 here
+#         # FIXME - we really should support recurrent inference
+#         return config.model.ctx_len
+
+#     @property
+#     def batch_size(self):
+#         # TODO: fix multi-gpu
+#         return self.batch_size_per_gpu  # * gpus
+
+#     @property
+#     def device(self):
+#         # Isn't used because we override _loglikelihood_tokens
+#         raise NotImplementedError()
+
+#     def tok_encode(self, string: str):
+#         return self.tokenizer.encode(string, add_special_tokens=False)
+
+#     def tok_decode(self, tokens):
+#         return self.tokenizer.decode(tokens)
+
+    # @torch.no_grad()
+    # def _loglikelihood_tokens(self, requests, disable_tqdm=False):
+    #     global logitBuf, correctBuf
+
+    #     res = []
+
+    #     # sort requests by descending total length, so we batch together groups that have similar padded sizes, descending so we OOM early if at all
+    #     rq_indices = sorted(range(len(requests)),key=lambda i: len(requests[i][1])+len(requests[i][2]), reverse=True)
+
+    #     res = [None for _ in range(len(requests))]
+
+    #     B = self.batch_size_per_gpu
+    #     for nb in range(0, len(requests), B):
+    #         ne = min(nb+B, len(requests))
+
+    #         # stack and pad to longest
+    #         batched_inputs = []
+    #         batch_info = []
+    #         maxlen = 0
+    #         for i in range(nb, ne):
+    #             rq_index = rq_indices[i]
+    #             request = requests[rq_index]
+    #             q = RWKV_PAD + request[1]
+    #             src = q + request[2]
+    #             input = torch.tensor(src, dtype=torch.long, device=device, requires_grad=False)
+    #             batched_inputs.append( input )
+    #             batch_info.append((len(q), len(src), rq_index))
+    #             maxlen = max(maxlen, len(src))
+
+    #         maxlen = (maxlen + 7) // 8 * 8 # round pad size up to nearest 8 for better GPU usage
+    #         for i in range(len(batched_inputs)):
+    #             batched_inputs[i] = F.pad(batched_inputs[i], (0, maxlen - batched_inputs[i].size(0)))
+    #         batched_inputs = torch.stack(batched_inputs, dim=0)
+
+    #         results = model.forward(batched_inputs, None)
+    #         if isinstance(results, tuple):
+    #             logits = results[0]
+    #             #next_model_state = results[1]
+    #         elif isinstance(results, torch.Tensor):
+    #             logits = results
+    #             #next_model_state = last_model_state
+    #         else:
+    #             logits = results.logits
+    #             #next_model_state = last_model_state
                 
 
-            batched_logprobs = F.log_softmax(logits, dim=-1)
-            # Check if per-token argmax is exactly equal to continuation
-            batched_greedy_toks = batched_logprobs.argmax(dim=-1)
+    #         batched_logprobs = F.log_softmax(logits, dim=-1)
+    #         # Check if per-token argmax is exactly equal to continuation
+    #         batched_greedy_toks = batched_logprobs.argmax(dim=-1)
             
-            for i, info in enumerate(batch_info):
-                q_len, src_len, rq_index = info
-                a_len = src_len - q_len
-                logprobs, a_toks, greedy_toks = batched_logprobs[i, q_len-1 : src_len-1], batched_inputs[i, q_len : src_len], batched_greedy_toks[i, q_len-1 : src_len-1]
-                assert logprobs.size(0) == a_len
-                assert a_toks.size(0) == a_len
-                assert greedy_toks.size(0) == a_len
-                max_equal = (greedy_toks == a_toks).all()
+    #         for i, info in enumerate(batch_info):
+    #             q_len, src_len, rq_index = info
+    #             a_len = src_len - q_len
+    #             logprobs, a_toks, greedy_toks = batched_logprobs[i, q_len-1 : src_len-1], batched_inputs[i, q_len : src_len], batched_greedy_toks[i, q_len-1 : src_len-1]
+    #             assert logprobs.size(0) == a_len
+    #             assert a_toks.size(0) == a_len
+    #             assert greedy_toks.size(0) == a_len
+    #             max_equal = (greedy_toks == a_toks).all()
         
-                # Obtain log-probs at the corresponding continuation ('answer') token indices
-                logprobs = torch.gather(logprobs, 1, a_toks.unsqueeze(-1)).squeeze(-1)
-                assert logprobs.size(0) == a_len
+    #             # Obtain log-probs at the corresponding continuation ('answer') token indices
+    #             logprobs = torch.gather(logprobs, 1, a_toks.unsqueeze(-1)).squeeze(-1)
+    #             assert logprobs.size(0) == a_len
             
-                # Answer: (log prob, is-exact-match)
-                answer = (float(logprobs.sum()), bool(max_equal))
+    #             # Answer: (log prob, is-exact-match)
+    #             answer = (float(logprobs.sum()), bool(max_equal))
 
-                # place the answer into the slot that matches the original request (this is important or lm_eval_harness will return bad results!!!)
-                res[rq_index] = answer
+    #             # place the answer into the slot that matches the original request (this is important or lm_eval_harness will return bad results!!!)
+    #             res[rq_index] = answer
 
-            FREQ = 10 * B
-            if nb % FREQ == 0:
-                print(f'{nb//FREQ}/{len(requests)//FREQ}', end = ' ', flush=True)
+    #         FREQ = 10 * B
+    #         if nb % FREQ == 0:
+    #             print(f'{nb//FREQ}/{len(requests)//FREQ}', end = ' ', flush=True)
 
-        return res
+    #     return res
 
 if config.seed is None:
     config.seed = 1234 
@@ -547,7 +598,7 @@ print (f"{tokenizer=}")
 
 RWKV_PAD = []
 
-adapter = EvalHarnessAdapter(batch_size_per_gpu=config.bsz, tokenizer=tokenizer)
+adapter = EvalHarnessAdapter(model = model, batch_size_per_gpu=config.bsz, tokenizer=tokenizer)
 limit = config.limit
 with torch.no_grad():
     with torch.amp.autocast(device_type='cuda', dtype=dtype):

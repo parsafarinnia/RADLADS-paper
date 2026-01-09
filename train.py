@@ -69,6 +69,7 @@ if __name__ == "__main__":
     if not os.path.exists(config.runtime.proj_path):
         os.makedirs(config.runtime.proj_path)
 
+
     assert config.train.train_stage >= -1
 
     EPOCH_SAMPLE_SIZE = 40320
@@ -344,6 +345,7 @@ if __name__ == "__main__":
         #    model = torch.jit.script(model)
         #    if teacher is not None:
         #        teacher = torch.jit.script(teacher)
+
 
     print("Instantiating wrapper model")
 

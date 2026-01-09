@@ -21,5 +21,5 @@ python3 train.py \
     -c configs/${RUN_NAME}/distill1.yaml \
     --train.load_model ${pths_dir}/Qwen3-8B-Base/pretrained.pth \
     --train.proj_name ${RUN_NAME} \
-    2>&1 | tee "${LOG_FILE}"
+    > "${LOG_FILE}" 2>&1
 

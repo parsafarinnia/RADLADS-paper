@@ -19,7 +19,6 @@ einops==0.8.1
 evaluate==0.4.6
 filelock==3.19.1
 flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention@3ddba2a043100837a1f6499b5eb6692de71a477b
-flash_attn==2.7.4.post1
 frozenlist==1.8.0
 fsspec==2025.3.0
 fuzzywuzzy==0.18.0
