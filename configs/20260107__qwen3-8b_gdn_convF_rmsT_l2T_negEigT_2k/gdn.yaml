@@ -1,0 +1,14 @@
+model:
+  tmix: qwen3gdn
+  attention_type: gdn
+  mode: chunk
+  expand_v: 1
+  use_gate: true
+  allow_neg_eigval: true
+  use_short_conv: false
+  conv_size: 4
+  conv_bias: false
+  conv_zero_init: true
+  use_qk_l2norm_in_kernel: true
+  use_qk_rmsnorm: true
+

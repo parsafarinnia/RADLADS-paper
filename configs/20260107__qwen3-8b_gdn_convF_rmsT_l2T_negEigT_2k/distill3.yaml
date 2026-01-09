@@ -1,0 +1,36 @@
+model:
+  ctx_len: 2048
+
+train:
+  wandb: hybrid_training
+  
+  proj_suffix: 3
+  train_stage: 3
+  load_partial: 0
+
+  data_type: "binidx" 
+  data_file: "/mnt/nfs/parsa/data/radlad_data_steps/stag1_500M_binidx"
+  my_exit_tokens: 499844135
+  magic_prime: 244043
+
+  optimizer: dsfusedadamw
+  lr_wait: 0.8
+  lr_decay_type: linear
+  lr_init: 7e-6
+  lr_final: 7e-6
+  warmup_steps: 50 
+  beta1: 0.9 
+  beta2: 0.95 
+  adam_eps: 1e-8 
+  weight_decay: 0
+
+  devices: 8
+  num_nodes: 1
+  micro_bsz: 4  # Reduced for 2048 ctx_len (higher memory usage)
+  accumulate_grad_batches: 1
+  strategy: fsdp 
+  grad_cp: 1
+  ds_bucket_mb: 200
+
+  epoch_save: 1
+

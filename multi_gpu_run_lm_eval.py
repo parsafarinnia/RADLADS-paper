@@ -1,5 +1,6 @@
 ########################################################################################################
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
+# Multi-GPU version with DistributedDataParallel support via torchrun
 ########################################################################################################
 #
 # pip install rwkv lm_eval --upgrade
@@ -13,6 +14,7 @@ np.set_printoptions(precision=4, suppress=True, linewidth=200)
 from transformers import AutoModelForCausalLM
 
 import torch
+import torch.distributed as dist
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -38,6 +40,25 @@ datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
 from tqdm import tqdm
 
 ########################################################################################################
+
+# Initialize DistributedDataParallel if running under torchrun
+use_ddp = False
+local_rank = 0
+world_size = 1
+rank = 0
+
+if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+    # Running under torchrun or similar distributed launcher
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
+    
+    # Initialize process group
+    dist.init_process_group(backend='nccl', init_method='env://')
+    use_ddp = True
+    print(f"Initialized DDP: rank={rank}, world_size={world_size}, local_rank={local_rank}")
+else:
+    print("Not running under distributed launcher, using single GPU")
 
 from dataclasses import dataclass
 import typing
@@ -65,6 +86,8 @@ print (sys.argv)
 config, errors = parse_cmdline_configs(sys.argv[1:], CLI_Config)
 if errors != '':
     print(errors)
+    if use_ddp:
+        dist.destroy_process_group()
     exit()
 pprint (config)
 
@@ -94,9 +117,21 @@ print (f"{tasks_existed=}")
 print (f"{eval_tasks=}")
 if not eval_tasks:
     print ("all tasks evaluated in results dir; nothing to evaluate")
+    if use_ddp:
+        dist.destroy_process_group()
     exit()
 
 config.train = None # to avoid clashes with training configs
+
+# Set device based on DDP local_rank EARLY, before loading checkpoint
+# This ensures each process uses its assigned GPU from the start
+if use_ddp:
+    device = f'cuda:{local_rank}'
+    torch.cuda.set_device(local_rank)
+    print(f"Using device: {device} (rank {rank}/{world_size})")
+else:
+    device = 'cuda'
+    print(f"Using device: {device}")
 
 ## Set for linearization ##
 if config.is_pretrained == "no":
@@ -118,13 +153,16 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 print(f'Loading model - {model_path}')
 if config.is_pretrained == "yes":
-    model = AutoModelForCausalLM.from_pretrained(model_path)
+    # Load pretrained model to CPU first, then move to correct device
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
 elif config.is_pretrained == "no":
     classname = config.model.classname
     if config.path.lower().endswith('.safetensors'):
         load_dict = load_file(config.path)
     else:
-        load_dict = torch.load(model_path, mmap=True)
+        # Load checkpoint to CPU first to avoid all processes loading to GPU 0
+        # Then we'll move it to the correct device
+        load_dict = torch.load(model_path, mmap=True, map_location='cpu')
     if any([
         (classname.startswith('qwen2') or config.model.tmix.startswith('qwen2')) and config.model.n_embd < 3584,
         (classname.startswith('qwen3') or config.model.tmix.startswith('qwen3')) and config.model.n_embd < 4096,
@@ -137,6 +175,8 @@ elif config.is_pretrained == "no":
             model_factory = locate(model_classpath)
             if model_factory is None:
                 print(f"Unsupported model type: {model_classpath}")
+                if use_ddp:
+                    dist.destroy_process_group()
                 exit(0)
             model = model_factory(config)
         #elif config.model.tmix.startswith('qwen2'):
@@ -161,47 +201,27 @@ match config.precision:
     case 'bf16':
         dtype = torch.bfloat16
     case _:
-        print("Bad precision type specified")
-        exit()
+        # Default to bfloat16 for memory efficiency if not specified
+        print(f"Precision not specified, defaulting to bfloat16 for memory efficiency")
+        dtype = torch.bfloat16
 
-device = 'cuda'
+# Device is already set above, now move model to device
 model = model.to(device=device, dtype=dtype)
 
-# Check if model uses custom operations incompatible with DataParallel
-# Models with Triton kernels or custom CUDA ops (like GDN) don't work with DataParallel
-use_data_parallel = False
-if torch.cuda.device_count() > 1:
-    # Check if this is a custom model that might not support DataParallel
-    # Models with custom attention (like GDN) use Triton kernels that don't work with DataParallel
-    if hasattr(config, 'model') and hasattr(config.model, 'attention_type'):
-        attention_type = getattr(config.model, 'attention_type', None)
-        if attention_type and attention_type not in ['rwkv7', 'rwkv7_fla_fused_recurrent']:
-            # Custom attention types (like 'gdn') use Triton kernels that don't work with DataParallel
-            print(f"Model uses custom attention type '{attention_type}' which is incompatible with DataParallel.")
-            print(f"Using single GPU (device 0) for evaluation.")
-            use_data_parallel = False
-        else:
-            # Standard attention types might work with DataParallel
-            use_data_parallel = True
-    elif config.is_pretrained == "yes":
-        # For pretrained HuggingFace models, DataParallel might work
-        use_data_parallel = True
-    else:
-        # For custom models without explicit attention_type, assume they might not support DataParallel
-        print("Custom model detected. DataParallel may not be compatible. Using single GPU.")
-        use_data_parallel = False
-
-if use_data_parallel:
-    try:
-        model = torch.nn.DataParallel(model)
-        original_model = model.module
-        print(f"Successfully using {torch.cuda.device_count()} GPUs with DataParallel")
-    except Exception as e:
-        print(f"Failed to initialize DataParallel: {e}. Falling back to single GPU.")
-        use_data_parallel = False
-        original_model = model
+# Wrap model with DistributedDataParallel if using DDP
+# DDP works with custom Triton kernels unlike DataParallel
+if use_ddp:
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False
+    )
+    original_model = model.module
+    print(f"Model wrapped with DistributedDataParallel on {device}")
 else:
     original_model = model
+    print("Using single GPU (no DDP)")
 
 model.eval()
 
@@ -255,7 +275,7 @@ class EvalHarnessAdapter(TemplateLM):
 
         logits_list = []
         if config.is_pretrained == "yes":
-            model_device = original_model.device if use_data_parallel else model.device
+            model_device = original_model.device
             inputs = self.tokenizer([ctx], return_tensors="pt").to(model_device)
             inputs_len = inputs['input_ids'].shape[1]
             outputs = model.generate(**inputs, max_new_tokens=self.max_gen_toks)
@@ -336,7 +356,6 @@ class EvalHarnessAdapter(TemplateLM):
             batch_input_ids = inputs['input_ids']
 
             is_eos_generated = [False for _ in range(len(batch_input_ids))]
-
             all_tokens_batch = [[] for _ in range(len(batch_input_ids))]
             out_str_batch = ['' for _ in range(len(batch_input_ids))]
             out_last = 0
@@ -353,7 +372,7 @@ class EvalHarnessAdapter(TemplateLM):
                     F.pad(
                         batch_input_ids[i],
                         (padded_len, 0),
-                        value=original_model.config.model.vocab_padding_idx if use_data_parallel else model.config.model.vocab_padding_idx # self.tokenizer.special_tokens_map["pad_token"]
+                        value=original_model.config.model.vocab_padding_idx
                     )
                 )
                 attention_mask_batch_list.append([0] * padded_len + [1] * len(batch_input_ids[i]))
@@ -507,8 +526,12 @@ class EvalHarnessAdapter(TemplateLM):
         res = [None for _ in range(len(requests))]
 
         B = self.batch_size_per_gpu
-        for nb in range(0, len(requests), B):
-            ne = min(nb+B, len(requests))
+        # Use batching but keep it conservative to avoid OOM
+        # With bfloat16, we should have enough memory for small batches
+        effective_batch_size = min(B, 4) if use_ddp else B
+        
+        for nb in range(0, len(requests), effective_batch_size):
+            ne = min(nb+effective_batch_size, len(requests))
 
             # stack and pad to longest
             batched_inputs = []
@@ -519,8 +542,15 @@ class EvalHarnessAdapter(TemplateLM):
                 request = requests[rq_index]
                 q = RWKV_PAD + request[1]
                 src = q + request[2]
+                
+                # Truncate if sequence is too long (safety measure)
+                max_seq_len = config.model.ctx_len if hasattr(config, 'model') and hasattr(config.model, 'ctx_len') else 2048
+                if len(src) > max_seq_len:
+                    src = src[:max_seq_len]
+                    q = src[:len(q)] if len(q) < max_seq_len else src[:max_seq_len-len(request[2])]
+                
                 input = torch.tensor(src, dtype=torch.long, device=device, requires_grad=False)
-                batched_inputs.append( input )
+                batched_inputs.append(input)
                 batch_info.append((len(q), len(src), rq_index))
                 maxlen = max(maxlen, len(src))
 
@@ -529,40 +559,43 @@ class EvalHarnessAdapter(TemplateLM):
                 batched_inputs[i] = F.pad(batched_inputs[i], (0, maxlen - batched_inputs[i].size(0)))
             batched_inputs = torch.stack(batched_inputs, dim=0)
 
-            results = model.forward(batched_inputs, None)
-            if isinstance(results, tuple):
-                logits = results[0]
-                #next_model_state = results[1]
-            elif isinstance(results, torch.Tensor):
-                logits = results
-                #next_model_state = last_model_state
-            else:
-                logits = results.logits
-                #next_model_state = last_model_state
+            # Use inference_mode for even less memory overhead than no_grad
+            with torch.inference_mode():
+                results = model.forward(batched_inputs, None)
+                if isinstance(results, tuple):
+                    logits = results[0]
+                elif isinstance(results, torch.Tensor):
+                    logits = results
+                else:
+                    logits = results.logits
+                    
+
+                batched_logprobs = F.log_softmax(logits, dim=-1)
+                # Check if per-token argmax is exactly equal to continuation
+                batched_greedy_toks = batched_logprobs.argmax(dim=-1)
                 
-
-            batched_logprobs = F.log_softmax(logits, dim=-1)
-            # Check if per-token argmax is exactly equal to continuation
-            batched_greedy_toks = batched_logprobs.argmax(dim=-1)
+                for i, info in enumerate(batch_info):
+                    q_len, src_len, rq_index = info
+                    a_len = src_len - q_len
+                    logprobs, a_toks, greedy_toks = batched_logprobs[i, q_len-1 : src_len-1], batched_inputs[i, q_len : src_len], batched_greedy_toks[i, q_len-1 : src_len-1]
+                    assert logprobs.size(0) == a_len
+                    assert a_toks.size(0) == a_len
+                    assert greedy_toks.size(0) == a_len
+                    max_equal = (greedy_toks == a_toks).all()
             
-            for i, info in enumerate(batch_info):
-                q_len, src_len, rq_index = info
-                a_len = src_len - q_len
-                logprobs, a_toks, greedy_toks = batched_logprobs[i, q_len-1 : src_len-1], batched_inputs[i, q_len : src_len], batched_greedy_toks[i, q_len-1 : src_len-1]
-                assert logprobs.size(0) == a_len
-                assert a_toks.size(0) == a_len
-                assert greedy_toks.size(0) == a_len
-                max_equal = (greedy_toks == a_toks).all()
-        
-                # Obtain log-probs at the corresponding continuation ('answer') token indices
-                logprobs = torch.gather(logprobs, 1, a_toks.unsqueeze(-1)).squeeze(-1)
-                assert logprobs.size(0) == a_len
-            
-                # Answer: (log prob, is-exact-match)
-                answer = (float(logprobs.sum()), bool(max_equal))
+                    # Obtain log-probs at the corresponding continuation ('answer') token indices
+                    logprobs_gathered = torch.gather(logprobs, 1, a_toks.unsqueeze(-1)).squeeze(-1)
+                    assert logprobs_gathered.size(0) == a_len
+                
+                    # Answer: (log prob, is-exact-match)
+                    answer = (float(logprobs_gathered.sum()), bool(max_equal))
 
-                # place the answer into the slot that matches the original request (this is important or lm_eval_harness will return bad results!!!)
-                res[rq_index] = answer
+                    # place the answer into the slot that matches the original request (this is important or lm_eval_harness will return bad results!!!)
+                    res[rq_index] = answer
+
+            # Clear cache after each batch to reduce memory fragmentation
+            del logits, batched_logprobs, batched_greedy_toks, batched_inputs
+            torch.cuda.empty_cache()
 
             FREQ = 10 * B
             if nb % FREQ == 0:
@@ -587,64 +620,77 @@ RWKV_PAD = []
 
 adapter = EvalHarnessAdapter(batch_size_per_gpu=config.bsz, tokenizer=tokenizer)
 limit = config.limit
-with torch.no_grad():
+
+# Use inference_mode for maximum memory efficiency (even better than no_grad)
+# Also set memory allocator config to reduce fragmentation
+if use_ddp:
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+with torch.inference_mode():
     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-	    results = evaluator.simple_evaluate(
-	        model=adapter,
+        results = evaluator.simple_evaluate(
+            model=adapter,
             # model_args="trust_remote_code=True",
-	        tasks=eval_tasks,
-	        #provide_description=False,
-	        num_fewshot=config.num_fewshot,
-	        limit=limit,
-	        bootstrap_iters=10000,
-	        numpy_random_seed = config.seed,
-	        torch_random_seed = config.seed,
-	        fewshot_random_seed = config.seed,
-	    )
+            tasks=eval_tasks,
+            #provide_description=False,
+            num_fewshot=config.num_fewshot,
+            limit=limit,
+            bootstrap_iters=10000,
+            numpy_random_seed = config.seed,
+            torch_random_seed = config.seed,
+            fewshot_random_seed = config.seed,
+        )
 
-pprint ({
-    k: v
-    for k, v in results["results"].items()
-    if k in eval_tasks
-})
+# Only rank 0 should print and save results to avoid conflicts
+if not use_ddp or rank == 0:
+    pprint ({
+        k: v
+        for k, v in results["results"].items()
+        if k in eval_tasks
+    })
 
-# Merge new results into existing (new results override existing entries)
-existing_results.update(results['results'])
+    # Merge new results into existing (new results override existing entries)
+    existing_results.update(results['results'])
 
-if limit is None:
-    with open(results_file, 'w') as f:
-        json.dump(existing_results, f, indent=2)
+    if limit is None:
+        with open(results_file, 'w') as f:
+            json.dump(existing_results, f, indent=2)
 
-if limit is not None and limit <= 32:
-    # Convert numpy types and filter out non-serializable objects
-    def convert_to_serializable(obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items() if not callable(v)}
-        elif isinstance(obj, (list, tuple)):
-            return [convert_to_serializable(item) for item in obj if not callable(item)]
-        elif callable(obj):
-            return None  # Skip functions
-        else:
-            return obj
-    
-    # Create a serializable copy of results
-    results_serializable = convert_to_serializable(results)
-    # Remove None values (skipped functions)
-    def remove_none_values(obj):
-        if isinstance(obj, dict):
-            return {k: remove_none_values(v) for k, v in obj.items() if v is not None}
-        elif isinstance(obj, list):
-            return [remove_none_values(item) for item in obj if item is not None]
-        else:
-            return obj
-    
-    results_serializable = remove_none_values(results_serializable)
-    
-    with open(results_file_full, 'w') as f:
-        json.dump(results_serializable, f, indent=2)
+    if limit is not None and limit <= 32:
+        # Convert numpy types and filter out non-serializable objects
+        def convert_to_serializable(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items() if not callable(v)}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_serializable(item) for item in obj if not callable(item)]
+            elif callable(obj):
+                return None  # Skip functions
+            else:
+                return obj
+        
+        # Create a serializable copy of results
+        results_serializable = convert_to_serializable(results)
+        # Remove None values (skipped functions)
+        def remove_none_values(obj):
+            if isinstance(obj, dict):
+                return {k: remove_none_values(v) for k, v in obj.items() if v is not None}
+            elif isinstance(obj, list):
+                return [remove_none_values(item) for item in obj if item is not None]
+            else:
+                return obj
+        
+        results_serializable = remove_none_values(results_serializable)
+        
+        with open(results_file_full, 'w') as f:
+            json.dump(results_serializable, f, indent=2)
+
+# Cleanup DDP
+if use_ddp:
+    dist.destroy_process_group()
+

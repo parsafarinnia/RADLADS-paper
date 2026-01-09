@@ -1,13 +1,13 @@
 #!/bin/bash
 source "$(dirname "$0")/vars.sh"
 echo $RUN_NAME
-export CUDA_VISIBLE_DEVICES=0 #1,3,5 #0,1,2,3,4,5,6,7 #0,1,3,4,5,6,7
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 #0,1,3,4,5,6,7
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export BASE="${1:-/work/${USERNAME}}/radlads"
 export HF_CACHE_DIR="${BASE}/.cache/huggingface/hub"
 export MAIN_PROCESS_PORT=29503
 
 bsz=32
-
 
 
 
@@ -25,8 +25,6 @@ python run_lm_eval.py \
     --bsz ${bsz} \
     --tasks ${tasks}
     # --tasks winogrande,arc_easy,arc_challenge,hellaswag,piqa,openbookqa
-
-
 
 
 
@@ -95,7 +93,6 @@ checkpoints+=('final')
 
 
 
-
 bsz=1
 for i in "${checkpoints[@]}"; do
     CKPT_PATH="${STEP2_PTH_PATH}/ckpt-${i}.pth"
@@ -119,4 +116,5 @@ for i in "${checkpoints[@]}"; do
 done
 
 python ~/exp.py --gpus 0
+
 
